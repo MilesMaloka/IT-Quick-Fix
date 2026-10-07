@@ -7,13 +7,16 @@ import dotenv from "dotenv";
 dotenv.config();
 
 let genAIClient: GoogleGenAI | null = null;
+let currentApiKey: string | null = null;
 
 function getGenAI(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
+  dotenv.config({ override: true });
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey) {
-    throw new Error("GEMINI_API_KEY is not set. Please configure it in Settings > Secrets.");
+    throw new Error("GEMINI_API_KEY is not set. Please add your key to GEMINI_API_KEY in the .env file.");
   }
-  if (!genAIClient) {
+  if (!genAIClient || currentApiKey !== apiKey) {
+    currentApiKey = apiKey;
     genAIClient = new GoogleGenAI({
       apiKey,
       httpOptions: {
@@ -35,6 +38,7 @@ You are "IT QuickFix Bot," an automated, friendly, and practical IT support tech
 1. Concise & Direct: Because you are on WhatsApp, keep messages compact, scannable, and under 180 words. Avoid filler introductions like "I understand how frustrating this is."
 2. Grounding & Search: Use Grounding with Google Search to find real, active YouTube videos. Query Google Search specifically for YouTube videos matching the user's technical issue (e.g. search for tutorial titles or site:youtube.com). NEVER guess, hallucinate, or construct fake YouTube watch URLs. Every YouTube URL must be an actual active link found in Google Search grounding results.
 3. Targeted Advice: Give the simplest, highest-probability fix first before suggesting advanced solutions (e.g., registry edits or OS reinstalls).
+4. No Emojis: Do NOT use any emojis, symbols, or pictograms in your response. Keep the response strictly professional text.
 
 ---
 
@@ -50,7 +54,7 @@ Every response must follow this exact layout:
 3. [Third action — verification or restart step]
 
 *Recommended Video Tutorial:*
-🎥 [Exact Video Title](Full YouTube URL found via search)
+[Exact Video Title](Full YouTube URL found via search)
 
 *Next Step:*
 Ask a short follow-up question: "Did this resolve the problem, or should we try an alternative fix?"
@@ -60,12 +64,13 @@ Ask a short follow-up question: "Did this resolve the problem, or should we try 
 # FORMATTING GUIDELINES FOR WHATSAPP
 - Use WhatsApp formatting: *bold* for important text and menu paths, _italics_ for emphasis, and single backticks (e.g., \`cmd\`, \`ipconfig /flushdns\`) for commands and key combinations.
 - Do not use markdown headers (###). Use plain capitalized text or bold labels instead.
-- If you cannot find a verified YouTube URL from the search grounding results, explicitly say: "🎥 Video search unavailable — follow the numbered steps above."
+- Absolutely NO emojis anywhere in the response.
+- If you cannot find a verified YouTube URL from live search grounding, provide a relevant tutorial search link in the format: [Watch Tutorial](https://www.youtube.com/results?search_query=how+to+fix+...)
 - Keep total output strictly under 180 words.`;
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
   app.use(express.json());
 
@@ -119,16 +124,70 @@ async function startServer() {
         parts: [{ text: message.trim() }],
       });
 
-      const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
-        contents,
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-          tools: [{ googleSearch: {} }],
-        },
-      });
+      const candidateModels = [
+        process.env.GEMINI_MODEL,
+        "gemini-3.5-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3.8-flash",
+      ].filter(Boolean) as string[];
+      const modelsToTry = [...new Set(candidateModels)];
 
-      const text = response.text || "";
+      let response: any = null;
+      let lastError: any = null;
+
+      for (const model of modelsToTry) {
+        // Try with search grounding first
+        try {
+          response = await ai.models.generateContent({
+            model,
+            contents,
+            config: {
+              systemInstruction: SYSTEM_INSTRUCTION,
+              tools: [{ googleSearch: {} }],
+            },
+          });
+          if (response?.text) break;
+        } catch (err: any) {
+          const isQuota =
+            err?.message?.includes("quota") ||
+            err?.status === "RESOURCE_EXHAUSTED" ||
+            err?.code === 429 ||
+            err?.status === 429;
+          
+          if (isQuota) {
+            console.warn(`Search grounding quota hit on ${model}; falling back to direct AI troubleshooting.`);
+          } else {
+            console.warn(`Model ${model} with search failed:`, err?.message || err);
+          }
+          lastError = err;
+
+          // Seamless fallback without search tool
+          try {
+            response = await ai.models.generateContent({
+              model,
+              contents,
+              config: {
+                systemInstruction: SYSTEM_INSTRUCTION,
+              },
+            });
+            if (response?.text) break;
+          } catch (errNoSearch: any) {
+            console.warn(`Model ${model} without search failed:`, errNoSearch?.message || errNoSearch);
+            lastError = errNoSearch;
+          }
+        }
+      }
+
+      if (!response?.text) {
+        throw lastError;
+      }
+
+      const rawText = response.text || "";
+      const text = rawText
+        .replace(/\p{Extended_Pictographic}/gu, "")
+        .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}]/gu, "")
+        .replace(/[🎥🛠️🔄✅❌⚠️📶💻🖨️🔊⚡⌨️🖱️]/gu, "")
+        .trim();
       const groundingMetadata = response.candidates?.[0]?.groundingMetadata;
       const groundingChunks = groundingMetadata?.groundingChunks || [];
       const searchQueries = groundingMetadata?.webSearchQueries || [];
@@ -139,18 +198,13 @@ async function startServer() {
         searchQueries,
       });
     } catch (error: any) {
+      console.error("Gemini API Error details:", error?.message || error);
       const isQuotaError = error?.message?.includes("quota") || error?.status === "RESOURCE_EXHAUSTED" || error?.code === 429 || error?.status === 429;
-      
-      if (!isQuotaError) {
-        console.error("Error in /api/chat:", error);
-      } else {
-        console.warn("Gemini API Quota Exceeded (429)");
-      }
       
       if (isQuotaError) {
         res.status(429).json({
           error: "Quota Exceeded",
-          message: "You have exceeded your Gemini API quota. Please check your plan in Google AI Studio or provide a new API key in Settings > Secrets.",
+          message: error?.message || "You have exceeded your Gemini API quota. Please check your plan in Google AI Studio or provide a new API key in .env.",
         });
         return;
       }
