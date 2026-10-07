@@ -1,0 +1,6 @@
+{
+  "name": "IT QuickFix Bot",
+  "description": "Automated IT support technician diagnosing technical issues with WhatsApp-formatted quick fixes and verified YouTube tutorials.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
